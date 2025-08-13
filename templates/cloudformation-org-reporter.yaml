@@ -1,0 +1,133 @@
+AWSTemplateFormatVersion: '2010-09-09'
+Description: 'AWS Organization Account Reporter: Envía por SNS un listado de Account ID + Name (Subject: "Reporte Cuentas - <cliente>").'
+
+Parameters:
+  EmailRecipient:
+    Type: String
+    Description: 'Correo de destino para recibir el listado'
+  ClientName:
+    Type: String
+    Description: 'Nombre del cliente para el asunto del correo (ej: ACME)'
+  ScheduleExpression:
+    Type: String
+    Default: 'cron(0 12 ? * 2#1 *)' # Primer lunes de cada mes, 12:00 UTC
+    Description: 'Expresión EventBridge: por defecto, primer lunes de cada mes a las 12:00 UTC'
+
+Resources:
+  ReporterLogGroup:
+    Type: AWS::Logs::LogGroup
+    Properties:
+      LogGroupName: !Sub '/aws/lambda/${AWS::StackName}-org-reporter'
+      RetentionInDays: 30
+
+  ReporterTopic:
+    Type: AWS::SNS::Topic
+    Properties:
+      TopicName: !Sub '${AWS::StackName}-org-reporter'
+      Subscription:
+        - Endpoint: !Ref EmailRecipient
+          Protocol: email
+
+  ReporterRole:
+    Type: AWS::IAM::Role
+    Properties:
+      AssumeRolePolicyDocument:
+        Version: '2012-10-17'
+        Statement:
+          - Effect: Allow
+            Principal: { Service: lambda.amazonaws.com }
+            Action: sts:AssumeRole
+      Policies:
+        - PolicyName: org-read-sns
+          PolicyDocument:
+            Version: '2012-10-17'
+            Statement:
+              - Sid: Logs
+                Effect: Allow
+                Action: [logs:CreateLogStream, logs:PutLogEvents]
+                Resource: !Sub '${ReporterLogGroup.Arn}:*'
+              - Sid: OrgsRead
+                Effect: Allow
+                Action:
+                  - organizations:ListAccounts
+                Resource: '*'
+              - Sid: Sns
+                Effect: Allow
+                Action: sns:Publish
+                Resource: !Ref ReporterTopic
+
+  ReporterFunction:
+    Type: AWS::Lambda::Function
+    Properties:
+      FunctionName: !Sub '${AWS::StackName}-org-reporter'
+      Runtime: python3.12
+      Handler: index.lambda_handler
+      Timeout: 30
+      Role: !GetAtt ReporterRole.Arn
+      Environment:
+        Variables:
+          SNS_TOPIC_ARN: !Ref ReporterTopic
+          CLIENT_NAME: !Ref ClientName
+      Code:
+        ZipFile: |
+          import boto3, os, traceback
+
+          def list_accounts():
+              org = boto3.client('organizations')
+              paginator = org.get_paginator('list_accounts')
+              for page in paginator.paginate():
+                  for a in page.get('Accounts', []):
+                      yield {"Id": a.get('Id'), "Name": a.get('Name')}
+
+          def format_csv(rows):
+              lines = ["AccountId,AccountName"]
+              for r in rows:
+                  name = (r['Name'] or '').replace(',', ' ')
+                  lines.append(f"{r['Id']},{name}")
+              return "\n".join(lines)
+
+          def publish_sns(topic_arn, subject, message):
+              boto3.client('sns').publish(
+                  TopicArn=topic_arn,
+                  Subject=subject,
+                  Message=message
+              )
+
+          def lambda_handler(event, context):
+              try:
+                  rows = list(list_accounts())
+                  body = format_csv(rows)
+                  client_name = os.environ.get('CLIENT_NAME', '').strip()
+                  subject_base = f"Reporte Cuentas - {client_name}" if client_name else "Reporte Cuentas"
+                  publish_sns(os.environ['SNS_TOPIC_ARN'], subject_base, body)
+                  return {'status':'ok','accounts':len(rows)}
+              except Exception as e:
+                  print("ERROR", e)
+                  print(traceback.format_exc())
+                  raise
+
+  ReporterRule:
+    Type: AWS::Events::Rule
+    Properties:
+      Name: !Sub '${AWS::StackName}-schedule'
+      ScheduleExpression: !Ref ScheduleExpression
+      State: ENABLED
+      Targets:
+        - Arn: !GetAtt ReporterFunction.Arn
+          Id: 'ReporterFnTarget'
+
+  PermissionForEventsToInvokeLambda:
+    Type: AWS::Lambda::Permission
+    Properties:
+      FunctionName: !Ref ReporterFunction
+      Action: lambda:InvokeFunction
+      Principal: events.amazonaws.com
+      SourceArn: !GetAtt ReporterRule.Arn
+
+Outputs:
+  SnsTopicArn:
+    Value: !Ref ReporterTopic
+  LambdaName:
+    Value: !Ref ReporterFunction
+  Schedule:
+    Value: !Ref ScheduleExpression
